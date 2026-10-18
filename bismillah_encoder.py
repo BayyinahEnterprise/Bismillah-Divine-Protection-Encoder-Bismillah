@@ -96,7 +96,6 @@ AL_ASMA_UL_HUSNA = [
     ("Al-Wasi", "The All-Encompassing"),
     ("Al-Hakim", "The Perfectly Wise"),
     ("Al-Wadud", "The Loving One"),
-    ("Al-Majid", "The Most Glorious"),
     ("Al-Ba'ith", "The Resurrector"),
     ("Ash-Shahid", "The Witness"),
     ("Al-Haqq", "The Truth"),
@@ -183,9 +182,15 @@ COMMENT_STYLES = {
 }
 
 TEXT_EXTENSIONS = {
-    '.md', '.txt', '.rst', '.csv', '.tsv', '.json', '.jsonl',
+    '.md', '.txt', '.rst',
     '.log', '.env', '.cfg', '.properties', '.fatima',
-    '.furqan_history', '.eml', '.lock', '.sum', '.mod', '.psv',
+    '.furqan_history', '.eml', '.psv',
+}
+
+# Structured formats -- Bismillah prepended text would break parsers.
+# These get sidecar-only protection.
+SIDECAR_ONLY_EXTENSIONS = {
+    '.json', '.jsonl', '.csv', '.tsv', '.lock', '.sum', '.mod',
 }
 
 OOXML_EXTENSIONS = {'.docx', '.xlsx', '.pptx'}
@@ -332,7 +337,10 @@ def embed_99_names_text(content):
 
 
 def embed_99_names_code(content, ext):
-    """Embed the 99 Names as comments in code files."""
+    """Embed the 99 Names as comments in code files (idempotent)."""
+    # Idempotency guard -- skip if already embedded
+    if 'Al-Asma ul-Husna' in content:
+        return content
     lines = content.split('\n')
     result = []
 
@@ -670,6 +678,18 @@ def seal_directory(directory, embed_names=False):
                 skipped += 1
                 continue
 
+            # Structured formats -- sidecar only (no text injection)
+            if ext in SIDECAR_ONLY_EXTENSIONS:
+                success, msg = create_sidecar(filepath)
+                if success:
+                    binary_sealed += 1
+                    sidecar_count += 1
+                    print("  SIDECAR: {} -- {}".format(rel, msg))
+                else:
+                    failed += 1
+                    print("  FAILED:  {} -- {}".format(rel, msg))
+                continue
+
             # Text/code files
             if is_text_file(ext):
                 result = seal_text_file(filepath, embed_names=embed_names)
@@ -722,8 +742,12 @@ def seal_directory(directory, embed_names=False):
     return {"text": text_sealed, "binary": binary_sealed, "failed": failed}
 
 
-def verify_directory(directory):
-    """Verify Bismillah protection across all files."""
+def verify_directory(directory, strict=False):
+    """Verify Bismillah protection across all files.
+
+    If strict=True, also recompute SHA-256 hashes and compare against
+    the manifest (Bismillah_MANIFEST_Bismillah.json).
+    """
     ZWC_BYTES = [b'\xe2\x80\x8b', b'\xe2\x80\x8c', b'\xe2\x80\x8d', b'\xef\xbb\xbf']
     total = 0
     protected = 0
@@ -816,8 +840,41 @@ def verify_directory(directory):
         for f in unprotected:
             print("    {}".format(f))
 
+    # Strict mode -- recompute hashes against manifest
+    tampered = []
+    if strict:
+        manifest_path = os.path.join(directory, 'Bismillah_MANIFEST_Bismillah.json')
+        if os.path.exists(manifest_path):
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+            manifest_files = manifest.get("files", {})
+            print("\n  STRICT HASH VERIFICATION:")
+            for rel_path, entry in manifest_files.items():
+                expected = entry.get("sha256")
+                if not expected:
+                    continue
+                full_path = os.path.join(directory, rel_path)
+                if not os.path.exists(full_path):
+                    tampered.append((rel_path, "MISSING"))
+                    print("    MISSING: {}".format(rel_path))
+                    continue
+                sha256 = hashlib.sha256()
+                with open(full_path, 'rb') as fh:
+                    for chunk in iter(lambda: fh.read(8192), b''):
+                        sha256.update(chunk)
+                actual = sha256.hexdigest()
+                if actual != expected:
+                    tampered.append((rel_path, "HASH MISMATCH"))
+                    print("    TAMPERED: {} (expected {:.8s}... got {:.8s}...)".format(
+                        rel_path, expected, actual))
+            if not tampered:
+                print("    All {} manifest entries verified.".format(len(manifest_files)))
+        else:
+            print("\n  STRICT: No manifest found at {}".format(manifest_path))
+            print("  Run 'manifest' command first to generate one.")
+
     print("  {}".format("=" * 60))
-    return {"total": total, "protected": protected, "unprotected": unprotected}
+    return {"total": total, "protected": protected, "unprotected": unprotected, "tampered": tampered}
 
 
 def generate_manifest(directory):
@@ -877,10 +934,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python bismillah_encoder.py seal ./my-project          # Seal all files
-  python bismillah_encoder.py seal ./my-project --names  # Seal + embed 99 Names
-  python bismillah_encoder.py verify ./my-project        # Verify protection
-  python bismillah_encoder.py manifest ./my-project      # Generate manifest
+  python bismillah_encoder.py seal ./my-project            # Seal all files
+  python bismillah_encoder.py seal ./my-project --names    # Seal + embed 99 Names
+  python bismillah_encoder.py verify ./my-project          # Verify protection
+  python bismillah_encoder.py verify ./my-project --strict # Verify + hash check
+  python bismillah_encoder.py manifest ./my-project        # Generate manifest
 
 {}
 """.format(BISMILLAH)
@@ -894,6 +952,8 @@ Examples:
 
     verify_p = sub.add_parser('verify', help='Verify Bismillah protection')
     verify_p.add_argument('path', help='Directory to verify')
+    verify_p.add_argument('--strict', action='store_true',
+                          help='Recompute SHA-256 hashes and compare against manifest')
 
     manifest_p = sub.add_parser('manifest', help='Generate integrity manifest')
     manifest_p.add_argument('path', help='Directory to manifest')
@@ -913,7 +973,11 @@ Examples:
     elif args.command == 'verify':
         target = args.path
         if os.path.isdir(target):
-            verify_directory(target)
+            result = verify_directory(target, strict=args.strict)
+            # Nonzero exit when unprotected or tampered files found
+            if result["unprotected"] or result.get("tampered"):
+                print("\n  {}\n".format(BISMILLAH))
+                sys.exit(2)
         else:
             print("  ERROR: {} is not a directory".format(target))
             sys.exit(1)
