@@ -37,6 +37,7 @@ import zipfile
 import shutil
 import tempfile
 import argparse
+import unicodedata
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -184,13 +185,15 @@ COMMENT_STYLES = {
 TEXT_EXTENSIONS = {
     '.md', '.txt', '.rst',
     '.log', '.env', '.cfg', '.properties', '.fatima',
-    '.furqan_history', '.eml', '.psv',
+    '.eml', '.psv',
 }
 
 # Structured formats -- Bismillah prepended text would break parsers.
-# These get sidecar-only protection.
+# Parser-sensitive and version-controlled fixtures get sidecar-only protection.
+# .furqan_history: Furqan tokenizer test fixtures -- ZWC injection breaks lexer tests.
 SIDECAR_ONLY_EXTENSIONS = {
     '.json', '.jsonl', '.csv', '.tsv', '.lock', '.sum', '.mod',
+    '.furqan_history',
 }
 
 OOXML_EXTENSIONS = {'.docx', '.xlsx', '.pptx'}
@@ -244,11 +247,28 @@ def extract_watermarks(content):
     return found
 
 
+def _nfc(data):
+    """NFC-normalize text bytes so equivalent Unicode sequences hash identically.
+
+    Binary content that fails UTF-8 decoding is returned unchanged --
+    normalization applies only to text.
+    """
+    try:
+        text = data.decode('utf-8')
+        return unicodedata.normalize('NFC', text).encode('utf-8')
+    except (UnicodeDecodeError, AttributeError):
+        return data
+
+
 def compute_seal(content_bytes):
-    """Compute Bismillah-anchored integrity seal."""
+    """Compute Bismillah-anchored integrity seal.
+
+    Content is NFC-normalized before hashing so that equivalent Unicode
+    sequences (e.g. precomposed vs decomposed Arabic) produce the same seal.
+    """
     h = hashlib.sha256()
     h.update(BISMILLAH.encode('utf-8'))
-    h.update(content_bytes)
+    h.update(_nfc(content_bytes))
     h.update(BISMILLAH.encode('utf-8'))
     return h.hexdigest()
 
@@ -272,11 +292,20 @@ def is_code_file(ext):
 #  LAYER 0 + 3: TEXT/CODE FILE SEALING
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _has_zwc_payload(content):
+    """Check if content already contains a ZWC watermark payload."""
+    return ZW_BOUNDARY in content
+
+
 def seal_text_content(content, ext):
-    """Apply Bismillah seal to text content (visible + invisible layers)."""
+    """Apply Bismillah seal to text content (visible + invisible layers).
+
+    Idempotent -- re-running on an already-sealed file is a no-op for
+    both Layer 0 (visible) and Layer 3a (steganographic).
+    """
     lines = content.split('\n')
 
-    # LAYER 0 -- Visible Bismillah at start and end
+    # LAYER 0 -- Visible Bismillah at start and end (idempotent)
     bismillah_line = make_comment(ext, BISMILLAH) if ext in COMMENT_STYLES else BISMILLAH
 
     has_start = any(
@@ -296,8 +325,8 @@ def seal_text_content(content, ext):
             lines.append('')
         lines.append(bismillah_line)
 
-    # LAYER 3 -- Steganographic watermark
-    if not is_code_file(ext):
+    # LAYER 3a -- Steganographic watermark (idempotent -- skip if ZWC already present)
+    if not is_code_file(ext) and not _has_zwc_payload(content):
         # Text/markdown: invisible zero-width encoding
         zwc_bismillah = text_to_zwc(BISMILLAH_ARABIC)
         for i, line in enumerate(lines):
@@ -653,15 +682,19 @@ def is_text_file(ext):
     return ext in COMMENT_STYLES or ext in TEXT_EXTENSIONS
 
 
-def seal_directory(directory, embed_names=False):
-    """Apply complete Bismillah protection to all files in a directory."""
+def seal_directory(directory, embed_names=False, dry_run=False):
+    """Apply complete Bismillah protection to all files in a directory.
+
+    If dry_run=True, report what would change without writing anything.
+    """
     text_sealed = 0
     binary_sealed = 0
     sidecar_count = 0
     failed = 0
     skipped = 0
+    mode_label = "DRY RUN" if dry_run else "Beginning Divine Seal"
 
-    print("\n  {} -- Beginning Divine Seal\n".format(BISMILLAH))
+    print("\n  {} -- {}\n".format(BISMILLAH, mode_label))
 
     for dirpath, dirnames, filenames in os.walk(directory):
         if '.git' in dirpath:
@@ -680,25 +713,47 @@ def seal_directory(directory, embed_names=False):
 
             # Structured formats -- sidecar only (no text injection)
             if ext in SIDECAR_ONLY_EXTENSIONS:
-                success, msg = create_sidecar(filepath)
-                if success:
-                    binary_sealed += 1
-                    sidecar_count += 1
-                    print("  SIDECAR: {} -- {}".format(rel, msg))
+                if dry_run:
+                    sidecar_path = filepath + '.bismillah'
+                    if os.path.exists(sidecar_path):
+                        skipped += 1
+                        print("  SKIP:    {} -- sidecar already exists".format(rel))
+                    else:
+                        binary_sealed += 1
+                        sidecar_count += 1
+                        print("  WOULD SIDECAR: {}".format(rel))
                 else:
-                    failed += 1
-                    print("  FAILED:  {} -- {}".format(rel, msg))
+                    success, msg = create_sidecar(filepath)
+                    if success:
+                        binary_sealed += 1
+                        sidecar_count += 1
+                        print("  SIDECAR: {} -- {}".format(rel, msg))
+                    else:
+                        failed += 1
+                        print("  FAILED:  {} -- {}".format(rel, msg))
                 continue
 
             # Text/code files
             if is_text_file(ext):
-                result = seal_text_file(filepath, embed_names=embed_names)
-                if result.get("skipped"):
-                    skipped += 1
-                else:
+                if dry_run:
                     text_sealed += 1
-                    layers = result.get('layers', [])
-                    print("  TEXT:   {} [{}]".format(rel, ', '.join(layers)))
+                    layers = ["L0_VISIBLE"]
+                    if is_code_file(ext):
+                        if embed_names:
+                            layers.append("L3b_99_NAMES_COMMENTS")
+                    else:
+                        layers.append("L3a_STEGANOGRAPHIC")
+                        if embed_names:
+                            layers.append("L3a_99_NAMES_ZWC")
+                    print("  WOULD SEAL: {} [{}]".format(rel, ', '.join(layers)))
+                else:
+                    result = seal_text_file(filepath, embed_names=embed_names)
+                    if result.get("skipped"):
+                        skipped += 1
+                    else:
+                        text_sealed += 1
+                        layers = result.get('layers', [])
+                        print("  TEXT:   {} [{}]".format(rel, ', '.join(layers)))
                 continue
 
             # Binary files
@@ -712,15 +767,20 @@ def seal_directory(directory, embed_names=False):
             except Exception:
                 pass
 
-            success, msg = seal_binary_file(filepath)
-            if success:
+            if dry_run:
                 binary_sealed += 1
-                if 'idecar' in msg.lower():
-                    sidecar_count += 1
-                print("  BINARY: {} -- {}".format(rel, msg))
+                handler_name = "metadata" if ext in BINARY_HANDLERS else "sidecar"
+                print("  WOULD SEAL: {} [{}]".format(rel, handler_name))
             else:
-                failed += 1
-                print("  FAILED: {} -- {}".format(rel, msg))
+                success, msg = seal_binary_file(filepath)
+                if success:
+                    binary_sealed += 1
+                    if 'idecar' in msg.lower():
+                        sidecar_count += 1
+                    print("  BINARY: {} -- {}".format(rel, msg))
+                else:
+                    failed += 1
+                    print("  FAILED: {} -- {}".format(rel, msg))
 
     total = text_sealed + binary_sealed + skipped
     protected = text_sealed + binary_sealed
@@ -740,6 +800,10 @@ def seal_directory(directory, embed_names=False):
     print("  {}".format("=" * 60))
 
     return {"text": text_sealed, "binary": binary_sealed, "failed": failed}
+
+
+ENCODER_VERSION = "2.0.0"
+MANIFEST_FILENAME = "Bismillah_MANIFEST_Bismillah.json"
 
 
 def verify_directory(directory, strict=False):
@@ -843,7 +907,7 @@ def verify_directory(directory, strict=False):
     # Strict mode -- recompute hashes against manifest
     tampered = []
     if strict:
-        manifest_path = os.path.join(directory, 'Bismillah_MANIFEST_Bismillah.json')
+        manifest_path = os.path.join(directory, MANIFEST_FILENAME)
         if os.path.exists(manifest_path):
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest = json.load(f)
@@ -878,15 +942,25 @@ def verify_directory(directory, strict=False):
 
 
 def generate_manifest(directory):
-    """Generate a Bismillah integrity manifest."""
+    """Generate a Bismillah integrity manifest.
+
+    The manifest file itself is excluded from hashing -- a file can never
+    contain its own hash. This exclusion is declared in the manifest header.
+    """
+    import datetime
     manifest = {
         BISMILLAH: True,
-        "manifest_version": "1.0",
+        "manifest_version": "2.0",
+        "encoder_version": ENCODER_VERSION,
+        "seal_timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "generator": "Bismillah Divine Protection Encoder",
         "al_asma_count": len(AL_ASMA_UL_HUSNA),
+        "self_exclusion": "The manifest file ({}) is excluded from hashing -- "
+                          "a file cannot contain its own hash.".format(MANIFEST_FILENAME),
         "files": {}
     }
 
+    manifest_path = os.path.join(directory, MANIFEST_FILENAME)
     count = 0
     for dirpath, dirnames, filenames in os.walk(directory):
         if '.git' in dirpath:
@@ -896,16 +970,21 @@ def generate_manifest(directory):
         for fname in sorted(filenames):
             fpath = os.path.join(dirpath, fname)
             rel = os.path.relpath(fpath, directory)
+
+            # Self-exclusion -- manifest cannot hash itself
+            if os.path.abspath(fpath) == os.path.abspath(manifest_path):
+                continue
+
             try:
                 sha256 = hashlib.sha256()
                 with open(fpath, 'rb') as f:
-                    for chunk in iter(lambda: f.read(8192), b''):
-                        sha256.update(chunk)
+                    file_bytes = f.read()
+                sha256.update(file_bytes)
                 file_hash = sha256.hexdigest()
                 manifest["files"][rel] = {
                     "sha256": file_hash,
-                    "bismillah_seal": compute_seal(open(fpath, 'rb').read()),
-                    "size": os.path.getsize(fpath)
+                    "bismillah_seal": compute_seal(file_bytes),
+                    "size": len(file_bytes)
                 }
                 count += 1
             except Exception as e:
@@ -913,12 +992,12 @@ def generate_manifest(directory):
 
     manifest["total_files"] = count
 
-    manifest_path = os.path.join(directory, 'Bismillah_MANIFEST_Bismillah.json')
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     print("\n  {} -- Manifest Generated".format(BISMILLAH))
-    print("  {} files catalogued".format(count))
+    print("  {} files catalogued (manifest self-excluded)".format(count))
+    print("  Encoder version: {}".format(ENCODER_VERSION))
     print("  Written to: {}".format(manifest_path))
 
     return manifest
@@ -939,6 +1018,8 @@ Examples:
   python bismillah_encoder.py verify ./my-project          # Verify protection
   python bismillah_encoder.py verify ./my-project --strict # Verify + hash check
   python bismillah_encoder.py manifest ./my-project        # Generate manifest
+  python bismillah_encoder.py seal ./my-project --dry-run  # Preview without writing
+  python bismillah_encoder.py decode ./my-project/README.md # Extract ZWC payloads
 
 {}
 """.format(BISMILLAH)
@@ -949,6 +1030,8 @@ Examples:
     seal_p.add_argument('path', help='Directory to seal')
     seal_p.add_argument('--names', action='store_true',
                         help='Embed the 99 Names of Allah throughout all files')
+    seal_p.add_argument('--dry-run', action='store_true',
+                        help='Show what would change without writing anything')
 
     verify_p = sub.add_parser('verify', help='Verify Bismillah protection')
     verify_p.add_argument('path', help='Directory to verify')
@@ -958,6 +1041,9 @@ Examples:
     manifest_p = sub.add_parser('manifest', help='Generate integrity manifest')
     manifest_p.add_argument('path', help='Directory to manifest')
 
+    decode_p = sub.add_parser('decode', help='Extract and print ZWC watermark payloads')
+    decode_p.add_argument('path', help='File to decode')
+
     args = parser.parse_args()
 
     print("\n  {}".format(BISMILLAH))
@@ -965,7 +1051,8 @@ Examples:
     if args.command == 'seal':
         target = args.path
         if os.path.isdir(target):
-            seal_directory(target, embed_names=args.names)
+            seal_directory(target, embed_names=args.names,
+                           dry_run=getattr(args, 'dry_run', False))
         else:
             print("  ERROR: {} is not a directory".format(target))
             sys.exit(1)
@@ -988,6 +1075,26 @@ Examples:
             generate_manifest(target)
         else:
             print("  ERROR: {} is not a directory".format(target))
+            sys.exit(1)
+
+    elif args.command == 'decode':
+        target = args.path
+        if os.path.isfile(target):
+            try:
+                with open(target, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                payloads = extract_watermarks(content)
+                if payloads:
+                    print("  Found {} ZWC watermark payload(s):".format(len(payloads)))
+                    for i, payload in enumerate(payloads, 1):
+                        print("    [{}] {}".format(i, payload))
+                else:
+                    print("  No ZWC watermark payloads found in {}".format(target))
+            except UnicodeDecodeError:
+                print("  ERROR: {} is not a text file".format(target))
+                sys.exit(1)
+        else:
+            print("  ERROR: {} is not a file".format(target))
             sys.exit(1)
 
     else:
