@@ -440,9 +440,13 @@ def seal_text_file(filepath, embed_names=False):
             f.write(sealed)
 
     except (UnicodeDecodeError, ValueError) as e:
+        if isinstance(e, UnicodeDecodeError):
+            code, detail = "SKIPPED_BINARY_CONTENT", "not UTF-8 decodable"
+        else:
+            code, detail = "SKIPPED_UNSEALABLE_CONTENT", "value error during seal"
         result["findings"].append(make_finding(
-            filepath, "seal_text", "WARNING", "SKIPPED_BINARY_CONTENT",
-            "not UTF-8 decodable: {}".format(e)))
+            filepath, "seal_text", "WARNING", code,
+            "{}: {}".format(detail, e)))
         result["skipped"] = "binary_content"
 
     return result
@@ -697,15 +701,21 @@ def seal_binary_file(filepath):
     success, msg = handler(filepath)
     finding = None
     if not success:
-        # Fall back to sidecar if metadata injection fails
+        # Fall back to sidecar if metadata injection fails.
+        # The primary cause is captured before the fallback return
+        # overwrites it -- the finding must carry both causes.
+        primary = msg
         success, msg = create_sidecar(filepath)
         if success:
-            msg = "Sidecar (fallback after: {})".format(msg)
-            finding = make_finding(filepath, "seal_binary", "INFO",
-                                   "SIDECAR_FALLBACK", msg)
+            msg = "Sidecar (fallback after: {})".format(primary)
+            finding = make_finding(
+                filepath, "seal_binary", "INFO", "SIDECAR_FALLBACK",
+                "primary failure: {}; recovered via sidecar".format(primary))
         else:
-            finding = make_finding(filepath, "seal_binary", "ERROR",
-                                   "SEAL_FAILED", msg)
+            finding = make_finding(
+                filepath, "seal_binary", "ERROR", "SEAL_FAILED",
+                "primary failure: {}; sidecar fallback failure: {}".format(
+                    primary, msg))
     return success, msg, finding
 
 

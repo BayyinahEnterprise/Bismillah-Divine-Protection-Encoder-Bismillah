@@ -32,12 +32,15 @@ from bismillah_encoder import (
     _has_zwc_payload,
     seal_text_content,
     seal_directory,
+    seal_text_file,
+    seal_binary_file,
     verify_directory,
     generate_manifest,
     SealFinding,
     make_finding,
     FINDING_SEVERITIES,
 )
+from unittest.mock import patch
 
 
 class TestBismillahConstants(unittest.TestCase):
@@ -322,6 +325,72 @@ class TestSealFindings(unittest.TestCase):
         self.assertEqual(finding.severity, "WARNING")
         self.assertEqual(finding.code, "SKIPPED_BINARY_CONTENT")
         self.assertEqual(finding.message, "not UTF-8 decodable")
+
+    def test_finding_preserves_cause_through_fallback(self):
+        """Handler failure + successful sidecar fallback: INFO finding
+        carrying the primary cause, not the fallback's own message."""
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
+        try:
+            target = os.path.join(tmpdir, "image.png")
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+            def failing_handler(fp):
+                return False, "invalid PDF"
+
+            with patch.dict("bismillah_encoder.BINARY_HANDLERS",
+                            {".png": failing_handler}):
+                with patch("bismillah_encoder.create_sidecar",
+                           return_value=(True, "Sidecar created")):
+                    success, msg, finding = seal_binary_file(target)
+            self.assertTrue(success)
+            self.assertEqual(finding.severity, "INFO")
+            self.assertEqual(finding.code, "SIDECAR_FALLBACK")
+            self.assertIn("invalid PDF", finding.message)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_finding_carries_both_causes_on_total_failure(self):
+        """Handler failure + failed sidecar fallback: ERROR finding with
+        both the primary and the fallback failure text."""
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
+        try:
+            target = os.path.join(tmpdir, "image.png")
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+            def failing_handler(fp):
+                return False, "invalid PDF"
+
+            with patch.dict("bismillah_encoder.BINARY_HANDLERS",
+                            {".png": failing_handler}):
+                with patch("bismillah_encoder.create_sidecar",
+                           return_value=(False, "sidecar write failed")):
+                    success, msg, finding = seal_binary_file(target)
+            self.assertFalse(success)
+            self.assertEqual(finding.severity, "ERROR")
+            self.assertEqual(finding.code, "SEAL_FAILED")
+            self.assertIn("invalid PDF", finding.message)
+            self.assertIn("sidecar write failed", finding.message)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_text_seal_failure_propagates_through_seal_directory(self):
+        """A non-UTF-8 text file produces a WARNING finding that reaches
+        seal_directory's collected findings."""
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
+        try:
+            with open(os.path.join(tmpdir, "binary.txt"), "wb") as f:
+                f.write(b"\xff\xfe\x00bad")
+            result = seal_directory(tmpdir)
+            codes = [f.code for f in result["findings"]]
+            self.assertIn("SKIPPED_BINARY_CONTENT", codes)
+            finding = [f for f in result["findings"]
+                      if f.code == "SKIPPED_BINARY_CONTENT"][0]
+            self.assertEqual(finding.severity, "WARNING")
+            self.assertEqual(finding.operation, "seal_text")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_finding_in_verify_output(self):
         tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
