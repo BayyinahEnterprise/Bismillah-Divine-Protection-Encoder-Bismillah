@@ -1061,11 +1061,14 @@ def verify_zahir(filepath):
                 content = f.read()
             for zw in (ZW_ZERO, ZW_ONE, ZW_SEP, ZW_BOUNDARY):
                 content = content.replace(zw, "")
-            lines = content.split("\n")
-            non_empty_head = [l for l in lines[:3] if l.strip()]
-            non_empty_tail = [l for l in lines[-3:] if l.strip()]
-            has_start = any("bismillah" in l.lower().replace("-", "") for l in non_empty_head)
-            has_end = any("bismillah" in l.lower().replace("-", "") for l in non_empty_tail)
+            # Boundary check: the FIRST and LAST non-empty lines. The
+            # head match is never reused as the tail match -- a
+            # start-only Bismillah stays one-sided even on short files.
+            non_empty = [l for l in content.split("\n") if l.strip()]
+            has_start = bool(non_empty) and any(
+                "bismillah" in l.lower().replace("-", "") for l in non_empty[:1])
+            has_end = bool(non_empty) and any(
+                "bismillah" in l.lower().replace("-", "") for l in non_empty[-1:])
             if has_start and has_end:
                 layers.append(LAYER_L0)
             elif has_start or has_end:
@@ -1088,9 +1091,30 @@ def verify_zahir(filepath):
     else:
         sidecar_path = str(filepath) + ".bismillah"
         if os.path.exists(sidecar_path):
-            has_start = True
-            has_end = True
-            layers.append(LAYER_L6B)
+            # Sidecar existence alone is not verification -- the sidecar
+            # must carry Bismillah content, and the primary must exist.
+            try:
+                with open(sidecar_path, "r", encoding="utf-8") as f:
+                    sidecar_content = f.read()
+                if "bismillah" not in sidecar_content.lower():
+                    findings.append(make_finding(
+                        filepath, LAYER_L6B, "SEAL-ZAHIR-SIDECAR-EMPTY",
+                        SEVERITY_WARNING,
+                        "Sidecar exists but carries no Bismillah content"))
+                elif not os.path.exists(filepath):
+                    findings.append(make_finding(
+                        filepath, LAYER_L6B, "SEAL-ZAHIR-ORPHAN-SIDECAR",
+                        SEVERITY_WARNING,
+                        "Sidecar exists but the primary file is missing"))
+                else:
+                    has_start = True
+                    has_end = True
+                    layers.append(LAYER_L6B)
+            except (UnicodeDecodeError, OSError) as e:
+                findings.append(make_finding(
+                    filepath, LAYER_L6B, "SEAL-ZAHIR-READ-ERR", SEVERITY_WARNING,
+                    "Unable to inspect sidecar surface: {} ({})".format(
+                        type(e).__name__, e)))
     passed = bool(has_start and has_end)
     return {
         "passed": passed,

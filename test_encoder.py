@@ -532,13 +532,18 @@ class TestVerifyZahir(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_one_sided_bismillah_flags_warning(self):
+        """Short-file regression: a two-line file with Bismillah only at
+        the start must fail -- the head match is never reused as the
+        tail match, even when head and tail windows would overlap."""
         tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
         try:
             path = os.path.join(tmpdir, "note.txt")
             with open(path, "w") as f:
-                f.write("Bismillah ir-Rahman ir-Rahim\n" + "body line\n" * 5)
+                f.write("Bismillah ir-Rahman ir-Rahim\nbody\n")
             result = verify_zahir(path)
             self.assertFalse(result["passed"])
+            self.assertTrue(result["has_start"])
+            self.assertFalse(result["has_end"])
             codes = [f.code for f in result["findings"]]
             self.assertIn("SEAL-L0-ONE-SIDED", codes)
             warning = [f for f in result["findings"]
@@ -571,10 +576,42 @@ class TestVerifyZahir(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("{}\n")
             with open(path + ".bismillah", "w") as f:
-                f.write("Bismillah\n")
+                f.write("Bismillah ir-Rahman ir-Rahim\n")
             result = verify_zahir(path)
             self.assertTrue(result["passed"])
             self.assertIn(LAYER_L6B, result["layers"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_empty_sidecar_does_not_pass(self):
+        """Sidecar existence alone is not verification: an empty sidecar
+        produces a warning finding and does not pass."""
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
+        try:
+            path = os.path.join(tmpdir, "data.json")
+            with open(path, "w") as f:
+                f.write("{}\n")
+            with open(path + ".bismillah", "w") as f:
+                f.write("")
+            result = verify_zahir(path)
+            self.assertFalse(result["passed"])
+            codes = [f.code for f in result["findings"]]
+            self.assertIn("SEAL-ZAHIR-SIDECAR-EMPTY", codes)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_orphan_sidecar_flags_warning(self):
+        """A sidecar beside a missing primary file is flagged, not
+        treated as protection of the (nonexistent) primary."""
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
+        try:
+            path = os.path.join(tmpdir, "gone.json")
+            with open(path + ".bismillah", "w") as f:
+                f.write("Bismillah ir-Rahman ir-Rahim\n")
+            result = verify_zahir(path)
+            self.assertFalse(result["passed"])
+            codes = [f.code for f in result["findings"]]
+            self.assertIn("SEAL-ZAHIR-ORPHAN-SIDECAR", codes)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

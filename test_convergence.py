@@ -22,7 +22,9 @@ from bismillah_convergence import (
     PROCESS_1_ALIGNED,
     PROCESS_2_SHALLOW,
     PROCESS_3_PERFORMING,
+    PROCESS_UNASSESSED,
     _POSTURE_WORDS,
+    _same_lineage,
 )
 from bismillah_encoder import SealFinding, make_finding, LAYER_L0
 
@@ -61,12 +63,22 @@ class TestModeCollapseMarkers(unittest.TestCase):
         self.assertEqual(classify_munafiq_process({"M8_spec_impl_gap": 0.8}),
                          PROCESS_3_PERFORMING)
 
+    def test_classify_m2_unanchored_is_process_3(self):
+        """The framework names any unanchored payload a Process 3 signal."""
+        self.assertEqual(classify_munafiq_process({"M2_unanchored": 1}),
+                         PROCESS_3_PERFORMING)
+
+    def test_classify_no_markers_is_unassessed(self):
+        """An empty measurement is UNKNOWN, never alignment by default."""
+        self.assertEqual(classify_munafiq_process({}), PROCESS_UNASSESSED)
+
+    def test_classify_measured_clean_is_aligned(self):
+        self.assertEqual(classify_munafiq_process({"M1_echo_ratio": 0.1}),
+                         PROCESS_1_ALIGNED)
+
     def test_classify_compound_shallow(self):
         markers = {"M1_echo_ratio": 0.8, "M3_exclusion_absence": 0.6}
         self.assertEqual(classify_munafiq_process(markers), PROCESS_2_SHALLOW)
-
-    def test_classify_default_aligned(self):
-        self.assertEqual(classify_munafiq_process({}), PROCESS_1_ALIGNED)
 
     def test_classify_posture_compound_performing(self):
         markers = {"M7_posture_words": 2, "M1_echo_ratio": 0.5}
@@ -137,6 +149,74 @@ class TestConvergenceRecords(unittest.TestCase):
         record = create_convergence_record("SealFinding", "C04", 1)
         with self.assertRaises(ValueError):
             add_review_to_record(record, "Copilot", 1, "FAIL", 0)
+
+    def test_invalid_tier_rejected(self):
+        record = create_convergence_record("SealFinding", "C04", 1)
+        for tier in (0, 3, "1", None):
+            with self.assertRaises(ValueError):
+                add_review_to_record(record, "Copilot", tier, "PASS", 0)
+
+    def test_same_family_cannot_supply_weight_twice(self):
+        """Two PASS entries from one family must not reach weight 2.0."""
+        record = create_convergence_record("SealFinding", "C04", 1)
+        add_review_to_record(record, "Copilot", 1, "PASS", 2)
+        add_review_to_record(record, "Copilot", 1, "PASS", 1)
+        self.assertEqual(record["total_weight"], 1.0)
+        self.assertFalse(record["converged"])
+        self.assertEqual(record["status"], "OPEN")
+
+    def test_tier2_only_never_converges(self):
+        """Three Tier 2 passes reach 2.25 weight but lack a Tier 1 family."""
+        record = create_convergence_record("SealFinding", "C04", 1)
+        for family in ("Kimi k3", "Grok", "Meta"):
+            add_review_to_record(record, family, 2, "PASS", 3)
+        self.assertEqual(record["total_weight"], 2.25)
+        self.assertFalse(record["converged"])
+        self.assertEqual(record["status"], "OPEN")
+
+    def test_tier1_plus_two_tier2_converges(self):
+        record = create_convergence_record("SealFinding", "C04", 1)
+        add_review_to_record(record, "Copilot", 1, "PASS", 2)
+        add_review_to_record(record, "Kimi k3", 2, "PASS", 3)
+        add_review_to_record(record, "Grok", 2, "PASS", 1)
+        self.assertEqual(record["total_weight"], 2.5)
+        self.assertTrue(record["converged"])
+
+    def test_halt_blocks_convergence_even_at_weight(self):
+        """Two Tier 1 passes followed by HALT must not stay CONVERGED."""
+        record = create_convergence_record("SealFinding", "C04", 1)
+        add_review_to_record(record, "Copilot", 1, "PASS", 2)
+        add_review_to_record(record, "ChatGPT", 1, "PASS", 1)
+        self.assertTrue(record["converged"])
+        add_review_to_record(record, "Grok", 2, "HALT", 4)
+        self.assertFalse(record["converged"])
+        self.assertEqual(record["status"], "HALTED")
+
+    def test_producer_lineage_bypass_rejected(self):
+        """Reviewing under 'GLM-5.3' while the producer is 'Perplexity
+        Computer (GLM-5.3)' is a producer-lineage bypass and is
+        rejected under canonical token matching."""
+        record = create_convergence_record("SealFinding", "C04", 1)
+        with self.assertRaises(ValueError):
+            add_review_to_record(record, "GLM-5.3", 1, "PASS", 0)
+        self.assertTrue(_same_lineage("GLM-5.3",
+                                      "Perplexity Computer (GLM-5.3)"))
+        self.assertFalse(_same_lineage("Copilot",
+                                      "Perplexity Computer (GLM-5.3)"))
+
+    def test_review_of_different_commit_not_counted(self):
+        """A review bound to another commit is stored but carries no
+        weight against this record's artifact."""
+        record = create_convergence_record("SealFinding", "C04", 1,
+                                           commit_hash="aaa111")
+        add_review_to_record(record, "Copilot", 1, "PASS", 2,
+                              commit_hash="bbb222")
+        add_review_to_record(record, "ChatGPT", 1, "PASS", 1,
+                              commit_hash="aaa111")
+        self.assertEqual(record["total_weight"], 1.0)
+        self.assertFalse(record["converged"])
+        stored = [r for r in record["reviews"] if r["family"] == "Copilot"]
+        self.assertEqual(len(stored), 1)  # stored, not silently dropped
 
 
 # Bismillah ir-Rahman ir-Rahim
