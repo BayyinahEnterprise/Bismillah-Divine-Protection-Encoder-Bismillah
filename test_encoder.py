@@ -34,6 +34,9 @@ from bismillah_encoder import (
     seal_directory,
     verify_directory,
     generate_manifest,
+    SealFinding,
+    make_finding,
+    FINDING_SEVERITIES,
 )
 
 
@@ -301,6 +304,61 @@ class TestTamperDetection(unittest.TestCase):
         original = b"original content"
         tampered = b"tampered content"
         self.assertNotEqual(compute_seal(original), compute_seal(tampered))
+
+
+class TestSealFindings(unittest.TestCase):
+    """Graft C04 -- structured SealFinding error capture.
+
+    Errors surface as structured findings in seal results, verify
+    output, and manifests, preserving the original message text.
+    """
+
+    def test_finding_creation(self):
+        finding = make_finding("a.txt", "seal_text", "WARNING",
+                               "SKIPPED_BINARY_CONTENT",
+                               "not UTF-8 decodable")
+        self.assertEqual(finding.file, "a.txt")
+        self.assertEqual(finding.operation, "seal_text")
+        self.assertEqual(finding.severity, "WARNING")
+        self.assertEqual(finding.code, "SKIPPED_BINARY_CONTENT")
+        self.assertEqual(finding.message, "not UTF-8 decodable")
+
+    def test_finding_in_verify_output(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
+        try:
+            link = os.path.join(tmpdir, "broken.txt")
+            os.symlink("no_such_target", link)
+            result = verify_directory(tmpdir)
+            codes = [f.code for f in result["findings"]]
+            self.assertIn("UNREADABLE", codes)
+            unreadable = [f for f in result["findings"]
+                          if f.code == "UNREADABLE"]
+            self.assertTrue(all(f.severity == "ERROR" for f in unreadable))
+            self.assertTrue(all(f.operation == "verify" for f in unreadable))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_finding_severity_levels(self):
+        self.assertEqual(FINDING_SEVERITIES, ("INFO", "WARNING", "ERROR"))
+        with self.assertRaises(ValueError):
+            make_finding("a.txt", "seal_text", "CRITICAL", "X",
+                         "severity outside the declared set")
+        for severity in FINDING_SEVERITIES:
+            finding = make_finding("a.txt", "seal_text", severity, "X", "m")
+            self.assertIsInstance(finding, SealFinding)
+
+    def test_finding_in_manifest(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
+        try:
+            link = os.path.join(tmpdir, "broken.txt")
+            os.symlink("no_such_target", link)
+            manifest = generate_manifest(tmpdir)
+            entry = manifest["files"]["broken.txt"]
+            self.assertEqual(entry["finding"]["code"], "READ_FAILED")
+            self.assertEqual(entry["finding"]["severity"], "ERROR")
+            self.assertEqual(entry["finding"]["operation"], "manifest")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # Bismillah ir-Rahman ir-Rahim

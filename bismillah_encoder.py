@@ -38,6 +38,7 @@ import shutil
 import tempfile
 import argparse
 import unicodedata
+from collections import namedtuple
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -46,6 +47,24 @@ from pathlib import Path
 
 BISMILLAH = "Bismillah ir-Rahman ir-Rahim"
 BISMILLAH_ARABIC = "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STRUCTURED SEAL FINDINGS (Graft C04)
+#  Errors are data, not strings -- a finding carries the file, the
+#  operation, a severity, a stable code, and the original message.
+# ═══════════════════════════════════════════════════════════════════════════
+
+SealFinding = namedtuple("SealFinding",
+                         ["file", "operation", "severity", "code", "message"])
+FINDING_SEVERITIES = ("INFO", "WARNING", "ERROR")
+
+
+def make_finding(file, operation, severity, code, message):
+    """Build a SealFinding, rejecting unknown severity levels."""
+    if severity not in FINDING_SEVERITIES:
+        raise ValueError("unknown severity: {}".format(severity))
+    return SealFinding(file=file, operation=operation, severity=severity,
+                       code=code, message=message)
 
 # Al-Asma ul-Husna -- The 99 Beautiful Names of Allah
 AL_ASMA_UL_HUSNA = [
@@ -389,11 +408,14 @@ def embed_99_names_code(content, ext):
 
 def seal_text_file(filepath, embed_names=False):
     """Apply the full Bismillah seal to a text/code file."""
-    result = {"file": filepath, "layers": []}
+    result = {"file": filepath, "layers": [], "findings": []}
     p = Path(filepath)
     ext = p.suffix.lower()
 
     if p.name == SELF_NAME:
+        result["findings"].append(make_finding(
+            filepath, "seal_text", "INFO", "SKIPPED_SELF",
+            "encoder self-file is not sealed"))
         result["skipped"] = "self"
         return result
 
@@ -417,7 +439,10 @@ def seal_text_file(filepath, embed_names=False):
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(sealed)
 
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError) as e:
+        result["findings"].append(make_finding(
+            filepath, "seal_text", "WARNING", "SKIPPED_BINARY_CONTENT",
+            "not UTF-8 decodable: {}".format(e)))
         result["skipped"] = "binary_content"
 
     return result
@@ -661,16 +686,27 @@ BINARY_HANDLERS = {
 
 
 def seal_binary_file(filepath):
-    """Seal a binary file with Bismillah metadata or sidecar."""
+    """Seal a binary file with Bismillah metadata or sidecar.
+
+    Returns (success, msg, finding). finding is a SealFinding describing
+    the failure when the seal attempt failed, or the fallback when a
+    sidecar recovered it; None on clean success.
+    """
     ext = os.path.splitext(filepath)[1].lower()
     handler = BINARY_HANDLERS.get(ext, create_sidecar)
     success, msg = handler(filepath)
+    finding = None
     if not success:
         # Fall back to sidecar if metadata injection fails
         success, msg = create_sidecar(filepath)
         if success:
             msg = "Sidecar (fallback after: {})".format(msg)
-    return success, msg
+            finding = make_finding(filepath, "seal_binary", "INFO",
+                                   "SIDECAR_FALLBACK", msg)
+        else:
+            finding = make_finding(filepath, "seal_binary", "ERROR",
+                                   "SEAL_FAILED", msg)
+    return success, msg, finding
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -692,6 +728,7 @@ def seal_directory(directory, embed_names=False, dry_run=False):
     sidecar_count = 0
     failed = 0
     skipped = 0
+    findings = []
     mode_label = "DRY RUN" if dry_run else "Beginning Divine Seal"
 
     print("\n  {} -- {}\n".format(BISMILLAH, mode_label))
@@ -748,6 +785,7 @@ def seal_directory(directory, embed_names=False, dry_run=False):
                     print("  WOULD SEAL: {} [{}]".format(rel, ', '.join(layers)))
                 else:
                     result = seal_text_file(filepath, embed_names=embed_names)
+                    findings.extend(result.get("findings", []))
                     if result.get("skipped"):
                         skipped += 1
                     else:
@@ -772,7 +810,9 @@ def seal_directory(directory, embed_names=False, dry_run=False):
                 handler_name = "metadata" if ext in BINARY_HANDLERS else "sidecar"
                 print("  WOULD SEAL: {} [{}]".format(rel, handler_name))
             else:
-                success, msg = seal_binary_file(filepath)
+                success, msg, finding = seal_binary_file(filepath)
+                if finding is not None:
+                    findings.append(finding)
                 if success:
                     binary_sealed += 1
                     if 'idecar' in msg.lower():
@@ -799,7 +839,8 @@ def seal_directory(directory, embed_names=False, dry_run=False):
         print("  New seals applied: {:.1f}%".format(pct))
     print("  {}".format("=" * 60))
 
-    return {"text": text_sealed, "binary": binary_sealed, "failed": failed}
+    return {"text": text_sealed, "binary": binary_sealed, "failed": failed,
+            "findings": findings}
 
 
 ENCODER_VERSION = "2.0.0"
@@ -816,6 +857,7 @@ def verify_directory(directory, strict=False):
     total = 0
     protected = 0
     unprotected = []
+    findings = []
 
     for dirpath, dirnames, filenames in os.walk(directory):
         if '.git' in dirpath:
@@ -847,8 +889,9 @@ def verify_directory(directory, strict=False):
                     if b'ismillah' in data or b'ISMILLAH' in data:
                         protected += 1
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    findings.append(make_finding(
+                        fp, "verify", "ERROR", "UNREADABLE", str(e)))
 
             # OOXML: check inside ZIP
             if ext in OOXML_EXTENSIONS:
@@ -864,8 +907,9 @@ def verify_directory(directory, strict=False):
                             else:
                                 unprotected.append(os.path.relpath(fp, directory))
                             continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    findings.append(make_finding(
+                        fp, "verify", "ERROR", "UNREADABLE", str(e)))
 
             # ZIP: check for Bismillah.txt entry
             if ext == '.zip':
@@ -875,8 +919,9 @@ def verify_directory(directory, strict=False):
                             if 'Bismillah.txt' in z.namelist():
                                 protected += 1
                                 continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    findings.append(make_finding(
+                        fp, "verify", "ERROR", "UNREADABLE", str(e)))
 
             # Binary strings check
             try:
@@ -885,8 +930,9 @@ def verify_directory(directory, strict=False):
                 if b'ismillah' in data or b'Bismillah' in data:
                     protected += 1
                     continue
-            except Exception:
-                pass
+            except Exception as e:
+                findings.append(make_finding(
+                    fp, "verify", "ERROR", "UNREADABLE", str(e)))
 
             unprotected.append(os.path.relpath(fp, directory))
 
@@ -938,7 +984,8 @@ def verify_directory(directory, strict=False):
             print("  Run 'manifest' command first to generate one.")
 
     print("  {}".format("=" * 60))
-    return {"total": total, "protected": protected, "unprotected": unprotected, "tampered": tampered}
+    return {"total": total, "protected": protected, "unprotected": unprotected,
+            "tampered": tampered, "findings": findings}
 
 
 def generate_manifest(directory):
@@ -988,7 +1035,9 @@ def generate_manifest(directory):
                 }
                 count += 1
             except Exception as e:
-                manifest["files"][rel] = {"error": str(e)}
+                finding = make_finding(fpath, "manifest", "ERROR",
+                                       "READ_FAILED", str(e))
+                manifest["files"][rel] = {"finding": finding._asdict()}
 
     manifest["total_files"] = count
 
