@@ -35,10 +35,20 @@ from bismillah_encoder import (
     seal_text_file,
     seal_binary_file,
     verify_directory,
+    verify_zahir,
+    _sorted_walk,
     generate_manifest,
     SealFinding,
     make_finding,
-    FINDING_SEVERITIES,
+    SEVERITY_ERROR,
+    SEVERITY_WARNING,
+    SEVERITY_INFO,
+    LAYER_L0,
+    LAYER_L1,
+    LAYER_L6,
+    LAYER_L6B,
+    LAYER_MANIFEST,
+    LAYER_SYSTEM,
 )
 from unittest.mock import patch
 
@@ -310,24 +320,24 @@ class TestTamperDetection(unittest.TestCase):
 
 
 class TestSealFindings(unittest.TestCase):
-    """Graft C04 -- structured SealFinding error capture.
+    """Graft C04 -- structured SealFinding error capture (Evolved Language).
 
     Errors surface as structured findings in seal results, verify
     output, and manifests, preserving the original message text.
     """
 
     def test_finding_creation(self):
-        finding = make_finding("a.txt", "seal_text", "WARNING",
-                               "SKIPPED_BINARY_CONTENT",
-                               "not UTF-8 decodable")
-        self.assertEqual(finding.file, "a.txt")
-        self.assertEqual(finding.operation, "seal_text")
-        self.assertEqual(finding.severity, "WARNING")
-        self.assertEqual(finding.code, "SKIPPED_BINARY_CONTENT")
+        finding = make_finding("a.txt", LAYER_L0, "SEAL-TEXT-SKIPPED-BINARY-CONTENT",
+                               SEVERITY_WARNING, "not UTF-8 decodable")
+        self.assertEqual(finding.filepath, "a.txt")
+        self.assertEqual(finding.layer, LAYER_L0)
+        self.assertEqual(finding.severity, SEVERITY_WARNING)
+        self.assertEqual(finding.code, "SEAL-TEXT-SKIPPED-BINARY-CONTENT")
         self.assertEqual(finding.message, "not UTF-8 decodable")
+        self.assertIsInstance(finding.filepath, str)
 
     def test_finding_preserves_cause_through_fallback(self):
-        """Handler failure + successful sidecar fallback: INFO finding
+        """Handler failure + successful sidecar fallback: WARNING finding
         carrying the primary cause, not the fallback's own message."""
         tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
         try:
@@ -338,21 +348,24 @@ class TestSealFindings(unittest.TestCase):
             def failing_handler(fp):
                 return False, "invalid PDF"
 
+            findings = []
             with patch.dict("bismillah_encoder.BINARY_HANDLERS",
                             {".png": failing_handler}):
                 with patch("bismillah_encoder.create_sidecar",
                            return_value=(True, "Sidecar created")):
-                    success, msg, finding = seal_binary_file(target)
+                    success, msg = seal_binary_file(target, findings)
             self.assertTrue(success)
-            self.assertEqual(finding.severity, "INFO")
-            self.assertEqual(finding.code, "SIDECAR_FALLBACK")
-            self.assertIn("invalid PDF", finding.message)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].severity, SEVERITY_WARNING)
+            self.assertEqual(findings[0].code, "SEAL-BINARY-FALLBACK")
+            self.assertEqual(findings[0].layer, LAYER_L6)
+            self.assertIn("invalid PDF", findings[0].message)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_finding_carries_both_causes_on_total_failure(self):
-        """Handler failure + failed sidecar fallback: ERROR finding with
-        both the primary and the fallback failure text."""
+        """Handler failure + failed sidecar fallback: WARNING with the
+        primary cause plus ERROR with the sidecar failure."""
         tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
         try:
             target = os.path.join(tmpdir, "image.png")
@@ -362,16 +375,32 @@ class TestSealFindings(unittest.TestCase):
             def failing_handler(fp):
                 return False, "invalid PDF"
 
+            findings = []
             with patch.dict("bismillah_encoder.BINARY_HANDLERS",
                             {".png": failing_handler}):
                 with patch("bismillah_encoder.create_sidecar",
                            return_value=(False, "sidecar write failed")):
-                    success, msg, finding = seal_binary_file(target)
+                    success, msg = seal_binary_file(target, findings)
             self.assertFalse(success)
-            self.assertEqual(finding.severity, "ERROR")
-            self.assertEqual(finding.code, "SEAL_FAILED")
-            self.assertIn("invalid PDF", finding.message)
-            self.assertIn("sidecar write failed", finding.message)
+            self.assertEqual(len(findings), 2)
+            fallback = [f for f in findings if f.code == "SEAL-BINARY-FALLBACK"][0]
+            error = [f for f in findings if f.code == "SEAL-BINARY-ERROR"][0]
+            self.assertIn("invalid PDF", fallback.message)
+            self.assertEqual(error.severity, SEVERITY_ERROR)
+            self.assertEqual(error.layer, LAYER_L6B)
+            self.assertIn("sidecar write failed", error.message)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_seal_binary_file_contract_unchanged(self):
+        """Returns the v2.0.0 2-tuple contract; findings are a side effect."""
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
+        try:
+            target = os.path.join(tmpdir, "image.png")
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+            result = seal_binary_file(target)
+            self.assertEqual(len(result), 2)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -384,11 +413,28 @@ class TestSealFindings(unittest.TestCase):
                 f.write(b"\xff\xfe\x00bad")
             result = seal_directory(tmpdir)
             codes = [f.code for f in result["findings"]]
-            self.assertIn("SKIPPED_BINARY_CONTENT", codes)
+            self.assertIn("SEAL-TEXT-SKIPPED-BINARY-CONTENT", codes)
             finding = [f for f in result["findings"]
-                      if f.code == "SKIPPED_BINARY_CONTENT"][0]
-            self.assertEqual(finding.severity, "WARNING")
-            self.assertEqual(finding.operation, "seal_text")
+                      if f.code == "SEAL-TEXT-SKIPPED-BINARY-CONTENT"][0]
+            self.assertEqual(finding.severity, SEVERITY_WARNING)
+            self.assertEqual(finding.layer, LAYER_L0)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_unreadable_text_file_records_finding_not_abort(self):
+        """Kimi k2.8: an OSError during text sealing is recorded as a
+        finding rather than aborting the walk."""
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_finding_")
+        try:
+            target = os.path.join(tmpdir, "locked.txt")
+            with open(target, "w") as f:
+                f.write("content\n")
+            with patch("builtins.open",
+                       side_effect=PermissionError("denied")):
+                result = seal_text_file(target)
+            self.assertEqual(result.get("skipped"), "unreadable")
+            codes = [f.code for f in result["findings"]]
+            self.assertIn("SEAL-TEXT-UNREADABLE", codes)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -399,21 +445,22 @@ class TestSealFindings(unittest.TestCase):
             os.symlink("no_such_target", link)
             result = verify_directory(tmpdir)
             codes = [f.code for f in result["findings"]]
-            self.assertIn("UNREADABLE", codes)
+            self.assertIn("VERIFY-UNREADABLE", codes)
             unreadable = [f for f in result["findings"]
-                          if f.code == "UNREADABLE"]
-            self.assertTrue(all(f.severity == "ERROR" for f in unreadable))
-            self.assertTrue(all(f.operation == "verify" for f in unreadable))
+                          if f.code == "VERIFY-UNREADABLE"]
+            self.assertTrue(all(f.severity == SEVERITY_ERROR for f in unreadable))
+            self.assertTrue(all(f.layer == LAYER_SYSTEM for f in unreadable))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_finding_severity_levels(self):
-        self.assertEqual(FINDING_SEVERITIES, ("INFO", "WARNING", "ERROR"))
+        self.assertEqual((SEVERITY_INFO, SEVERITY_WARNING, SEVERITY_ERROR),
+                         ("INFO", "WARNING", "ERROR"))
         with self.assertRaises(ValueError):
-            make_finding("a.txt", "seal_text", "CRITICAL", "X",
+            make_finding("a.txt", LAYER_L0, "X", "CRITICAL",
                          "severity outside the declared set")
-        for severity in FINDING_SEVERITIES:
-            finding = make_finding("a.txt", "seal_text", severity, "X", "m")
+        for severity in (SEVERITY_INFO, SEVERITY_WARNING, SEVERITY_ERROR):
+            finding = make_finding("a.txt", LAYER_L0, "X", severity, "m")
             self.assertIsInstance(finding, SealFinding)
 
     def test_finding_in_manifest(self):
@@ -423,9 +470,124 @@ class TestSealFindings(unittest.TestCase):
             os.symlink("no_such_target", link)
             manifest = generate_manifest(tmpdir)
             entry = manifest["files"]["broken.txt"]
-            self.assertEqual(entry["finding"]["code"], "READ_FAILED")
+            self.assertEqual(entry["finding"]["code"], "MANIFEST-READ-FAILED")
             self.assertEqual(entry["finding"]["severity"], "ERROR")
-            self.assertEqual(entry["finding"]["operation"], "manifest")
+            self.assertEqual(entry["finding"]["layer"], LAYER_MANIFEST)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestSortedWalk(unittest.TestCase):
+    """Upgrade 4 -- deterministic traversal (Kimi k2.8 determinism fix)."""
+
+    def test_sorted_walk_deterministic_order(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_walk_")
+        try:
+            for sub in ("zeta", "alpha", "mid"):
+                os.makedirs(os.path.join(tmpdir, sub))
+                for name in ("b.txt", "a.txt"):
+                    with open(os.path.join(tmpdir, sub, name), "w") as f:
+                        f.write("x\n")
+            roots = [root for root, _, _ in _sorted_walk(tmpdir)]
+            self.assertEqual(roots[0], tmpdir)
+            subdirs = [os.path.relpath(r, tmpdir)
+                       for r in roots[1:]]
+            self.assertEqual(subdirs, sorted(subdirs))
+            for root, dirnames, filenames in _sorted_walk(tmpdir):
+                self.assertEqual(filenames, sorted(filenames))
+                self.assertEqual(dirnames, sorted(dirnames))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_sorted_walk_exclusions(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_walk_")
+        try:
+            os.makedirs(os.path.join(tmpdir, ".git", "objects"))
+            os.makedirs(os.path.join(tmpdir, "keep"))
+            roots = [os.path.relpath(root, tmpdir)
+                     for root, _, _ in _sorted_walk(tmpdir, exclusions={".git"})]
+            self.assertNotIn(".git", roots)
+            self.assertIn("keep", roots)
+            for root, dirnames, _ in _sorted_walk(tmpdir, exclusions={".git"}):
+                self.assertNotIn(".git", dirnames)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestVerifyZahir(unittest.TestCase):
+    """Upgrade 3 -- zahir surface verification (L0, L1, L3b, L6b)."""
+
+    def test_sealed_text_file_passes(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
+        try:
+            path = os.path.join(tmpdir, "note.txt")
+            with open(path, "w") as f:
+                f.write("Bismillah ir-Rahman ir-Rahim\n" + "body line\n" * 5 +
+                        "Bismillah ir-Rahman ir-Rahim\n")
+            result = verify_zahir(path)
+            self.assertTrue(result["passed"])
+            self.assertIn(LAYER_L0, result["layers"])
+            self.assertEqual(result["findings"], [])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_one_sided_bismillah_flags_warning(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
+        try:
+            path = os.path.join(tmpdir, "note.txt")
+            with open(path, "w") as f:
+                f.write("Bismillah ir-Rahman ir-Rahim\n" + "body line\n" * 5)
+            result = verify_zahir(path)
+            self.assertFalse(result["passed"])
+            codes = [f.code for f in result["findings"]]
+            self.assertIn("SEAL-L0-ONE-SIDED", codes)
+            warning = [f for f in result["findings"]
+                      if f.code == "SEAL-L0-ONE-SIDED"][0]
+            self.assertEqual(warning.severity, SEVERITY_WARNING)
+            self.assertEqual(warning.layer, LAYER_L0)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_missing_bismillah_flags_error(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
+        try:
+            path = os.path.join(tmpdir, "note.txt")
+            with open(path, "w") as f:
+                f.write("plain body\n")
+            result = verify_zahir(path)
+            self.assertFalse(result["passed"])
+            codes = [f.code for f in result["findings"]]
+            self.assertIn("SEAL-L0-MISSING", codes)
+            error = [f for f in result["findings"]
+                     if f.code == "SEAL-L0-MISSING"][0]
+            self.assertEqual(error.severity, SEVERITY_ERROR)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_sidecar_only_file_uses_layer_6b(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
+        try:
+            path = os.path.join(tmpdir, "data.json")
+            with open(path, "w") as f:
+                f.write("{}\n")
+            with open(path + ".bismillah", "w") as f:
+                f.write("Bismillah\n")
+            result = verify_zahir(path)
+            self.assertTrue(result["passed"])
+            self.assertIn(LAYER_L6B, result["layers"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_filename_convention_detected(self):
+        tmpdir = tempfile.mkdtemp(prefix="bismillah_zahir_")
+        try:
+            path = os.path.join(tmpdir, "Bismillah_note_Bismillah.txt")
+            with open(path, "w") as f:
+                f.write("Bismillah ir-Rahman ir-Rahim\n" + "body line\n" * 5 +
+                        "Bismillah ir-Rahman ir-Rahim\n")
+            result = verify_zahir(path)
+            self.assertTrue(result["filename_sealed"])
+            self.assertIn(LAYER_L1, result["layers"])
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

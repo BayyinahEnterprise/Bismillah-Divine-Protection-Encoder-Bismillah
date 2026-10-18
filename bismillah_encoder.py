@@ -49,22 +49,41 @@ BISMILLAH = "Bismillah ir-Rahman ir-Rahim"
 BISMILLAH_ARABIC = "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ"
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  STRUCTURED SEAL FINDINGS (Graft C04)
-#  Errors are data, not strings -- a finding carries the file, the
-#  operation, a severity, a stable code, and the original message.
+#  STRUCTURED SEAL FINDINGS (Graft C04 -- Evolved Language)
+#  Errors are data, not strings. Reconciled across all nine model
+#  families: filepath (Claude), layer (DeepSeek, L0-L6b taxonomy),
+#  code (Claude, GLM-5.3), severity (all families, three-valued),
+#  message (all families). The former `operation` field is absorbed
+#  into the code string.
 # ═══════════════════════════════════════════════════════════════════════════
 
 SealFinding = namedtuple("SealFinding",
-                         ["file", "operation", "severity", "code", "message"])
-FINDING_SEVERITIES = ("INFO", "WARNING", "ERROR")
+                         ["filepath", "layer", "code", "severity", "message"])
+
+SEVERITY_ERROR = "ERROR"
+SEVERITY_WARNING = "WARNING"
+SEVERITY_INFO = "INFO"
+_VALID_SEVERITIES = (SEVERITY_ERROR, SEVERITY_WARNING, SEVERITY_INFO)
+
+# Layer constants (domain-aligned with the encoder's own seal taxonomy)
+LAYER_L0 = "L0_VISIBLE"
+LAYER_L1 = "L1_FILENAME"
+LAYER_L3A = "L3a_STEGANOGRAPHIC"
+LAYER_L3B = "L3b_CODE_COMMENTS"
+LAYER_L5 = "L5_HASH_SEAL"
+LAYER_L6 = "L6_BINARY_METADATA"
+LAYER_L6B = "L6b_SIDECAR"
+LAYER_MANIFEST = "MANIFEST"
+LAYER_SYSTEM = "SYSTEM"
 
 
-def make_finding(file, operation, severity, code, message):
-    """Build a SealFinding, rejecting unknown severity levels."""
-    if severity not in FINDING_SEVERITIES:
-        raise ValueError("unknown severity: {}".format(severity))
-    return SealFinding(file=file, operation=operation, severity=severity,
-                       code=code, message=message)
+def make_finding(filepath, layer, code, severity, message):
+    """Build a SealFinding, rejecting unknown severity levels at construction."""
+    if severity not in _VALID_SEVERITIES:
+        raise ValueError("unknown severity: {} -- expected one of {}".format(
+            severity, _VALID_SEVERITIES))
+    return SealFinding(filepath=str(filepath), layer=layer, code=code,
+                       severity=severity, message=message)
 
 # Al-Asma ul-Husna -- The 99 Beautiful Names of Allah
 AL_ASMA_UL_HUSNA = [
@@ -414,7 +433,7 @@ def seal_text_file(filepath, embed_names=False):
 
     if p.name == SELF_NAME:
         result["findings"].append(make_finding(
-            filepath, "seal_text", "INFO", "SKIPPED_SELF",
+            filepath, LAYER_L0, "SEAL-TEXT-SKIPPED-SELF", SEVERITY_INFO,
             "encoder self-file is not sealed"))
         result["skipped"] = "self"
         return result
@@ -439,15 +458,19 @@ def seal_text_file(filepath, embed_names=False):
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(sealed)
 
-    except (UnicodeDecodeError, ValueError) as e:
+    except (UnicodeDecodeError, ValueError, OSError) as e:
+        # Kimi k2.8: OSError (including PermissionError) previously
+        # propagated unhandled and aborted the whole seal_directory walk.
         if isinstance(e, UnicodeDecodeError):
-            code, detail = "SKIPPED_BINARY_CONTENT", "not UTF-8 decodable"
+            code, detail = "SEAL-TEXT-SKIPPED-BINARY-CONTENT", "not UTF-8 decodable"
+        elif isinstance(e, ValueError):
+            code, detail = "SEAL-TEXT-SKIPPED-UNSEALABLE-CONTENT", "value error during seal"
         else:
-            code, detail = "SKIPPED_UNSEALABLE_CONTENT", "value error during seal"
+            code, detail = "SEAL-TEXT-UNREADABLE", "unreadable"
         result["findings"].append(make_finding(
-            filepath, "seal_text", "WARNING", code,
-            "{}: {}".format(detail, e)))
-        result["skipped"] = "binary_content"
+            filepath, LAYER_L0, code, SEVERITY_WARNING,
+            "{}: {} ({})".format(detail, e, type(e).__name__)))
+        result["skipped"] = "binary_content" if isinstance(e, (UnicodeDecodeError, ValueError)) else "unreadable"
 
     return result
 
@@ -689,34 +712,36 @@ BINARY_HANDLERS = {
 }
 
 
-def seal_binary_file(filepath):
+def seal_binary_file(filepath, findings=None):
     """Seal a binary file with Bismillah metadata or sidecar.
 
-    Returns (success, msg, finding). finding is a SealFinding describing
-    the failure when the seal attempt failed, or the fallback when a
-    sidecar recovered it; None on clean success.
+    Emits structured SealFinding entries (Graft C04, Evolved Language)
+    when a findings list is supplied.
+
+    Contract: returns (success, msg) -- same 2-tuple as v2.0.0.
+    Side effect: appends to the findings list if provided. This avoids
+    a return-arity change; the single caller in seal_directory passes
+    its collected findings list.
     """
     ext = os.path.splitext(filepath)[1].lower()
     handler = BINARY_HANDLERS.get(ext, create_sidecar)
     success, msg = handler(filepath)
-    finding = None
     if not success:
-        # Fall back to sidecar if metadata injection fails.
-        # The primary cause is captured before the fallback return
-        # overwrites it -- the finding must carry both causes.
-        primary = msg
+        primary_cause = msg  # Copilot: preserve primary cause through fallback
+        if findings is not None:
+            findings.append(make_finding(
+                filepath, LAYER_L6, "SEAL-BINARY-FALLBACK", SEVERITY_WARNING,
+                "Binary handler for {} failed ({}); falling back to sidecar".format(
+                    ext or "<binary>", msg)))
+        # Fall back to sidecar if metadata injection fails
         success, msg = create_sidecar(filepath)
         if success:
-            msg = "Sidecar (fallback after: {})".format(primary)
-            finding = make_finding(
-                filepath, "seal_binary", "INFO", "SIDECAR_FALLBACK",
-                "primary failure: {}; recovered via sidecar".format(primary))
-        else:
-            finding = make_finding(
-                filepath, "seal_binary", "ERROR", "SEAL_FAILED",
-                "primary failure: {}; sidecar fallback failure: {}".format(
-                    primary, msg))
-    return success, msg, finding
+            msg = "Sidecar (fallback after: {})".format(primary_cause)
+        elif findings is not None:
+            findings.append(make_finding(
+                filepath, LAYER_L6B, "SEAL-BINARY-ERROR", SEVERITY_ERROR,
+                "Failed to seal binary file: {}".format(msg)))
+    return success, msg
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -726,6 +751,24 @@ def seal_binary_file(filepath):
 def is_text_file(ext):
     """Check if extension is a text/code file."""
     return ext in COMMENT_STYLES or ext in TEXT_EXTENSIONS
+
+
+def _sorted_walk(directory, exclusions=None):
+    """Deterministic os.walk wrapper with sorted dirnames and filenames.
+
+    Yields (root, dirnames, filenames) with both lists sorted in-place.
+    Applies exclusion filtering (Anti-M3 declared exclusions) when provided.
+
+    Source: Kimi k2.8 (determinism finding -- unsorted os.walk traversal
+    is a reproducibility defect) + Claude (Anti-M3 exclusions).
+    """
+    for root, dirnames, filenames in os.walk(directory):
+        dirnames.sort()   # deterministic traversal order
+        filenames.sort()  # deterministic traversal order
+        if exclusions is not None:
+            # Anti-M3: skip excluded directories with declared reason
+            dirnames[:] = [d for d in dirnames if d not in exclusions]
+        yield root, dirnames, filenames
 
 
 def seal_directory(directory, embed_names=False, dry_run=False):
@@ -743,12 +786,10 @@ def seal_directory(directory, embed_names=False, dry_run=False):
 
     print("\n  {} -- {}\n".format(BISMILLAH, mode_label))
 
-    for dirpath, dirnames, filenames in os.walk(directory):
-        if '.git' in dirpath:
-            continue
-        dirnames[:] = [d for d in dirnames if d != '.git' and d != '__pycache__']
+    for dirpath, dirnames, filenames in _sorted_walk(
+            directory, exclusions={'.git', '__pycache__'}):
 
-        for fname in sorted(filenames):
+        for fname in filenames:
             filepath = os.path.join(dirpath, fname)
             rel = os.path.relpath(filepath, directory)
             ext = Path(fname).suffix.lower()
@@ -820,9 +861,7 @@ def seal_directory(directory, embed_names=False, dry_run=False):
                 handler_name = "metadata" if ext in BINARY_HANDLERS else "sidecar"
                 print("  WOULD SEAL: {} [{}]".format(rel, handler_name))
             else:
-                success, msg, finding = seal_binary_file(filepath)
-                if finding is not None:
-                    findings.append(finding)
+                success, msg = seal_binary_file(filepath, findings)
                 if success:
                     binary_sealed += 1
                     if 'idecar' in msg.lower():
@@ -869,10 +908,7 @@ def verify_directory(directory, strict=False):
     unprotected = []
     findings = []
 
-    for dirpath, dirnames, filenames in os.walk(directory):
-        if '.git' in dirpath:
-            continue
-        dirnames[:] = [d for d in dirnames if d != '.git']
+    for dirpath, dirnames, filenames in _sorted_walk(directory, exclusions={'.git'}):
 
         for fname in filenames:
             fp = os.path.join(dirpath, fname)
@@ -901,7 +937,7 @@ def verify_directory(directory, strict=False):
                         continue
                 except Exception as e:
                     findings.append(make_finding(
-                        fp, "verify", "ERROR", "UNREADABLE", str(e)))
+                        fp, LAYER_SYSTEM, "VERIFY-UNREADABLE", SEVERITY_ERROR, str(e)))
 
             # OOXML: check inside ZIP
             if ext in OOXML_EXTENSIONS:
@@ -919,7 +955,7 @@ def verify_directory(directory, strict=False):
                             continue
                 except Exception as e:
                     findings.append(make_finding(
-                        fp, "verify", "ERROR", "UNREADABLE", str(e)))
+                        fp, LAYER_SYSTEM, "VERIFY-UNREADABLE", SEVERITY_ERROR, str(e)))
 
             # ZIP: check for Bismillah.txt entry
             if ext == '.zip':
@@ -931,7 +967,7 @@ def verify_directory(directory, strict=False):
                                 continue
                 except Exception as e:
                     findings.append(make_finding(
-                        fp, "verify", "ERROR", "UNREADABLE", str(e)))
+                        fp, LAYER_SYSTEM, "VERIFY-UNREADABLE", SEVERITY_ERROR, str(e)))
 
             # Binary strings check
             try:
@@ -942,7 +978,7 @@ def verify_directory(directory, strict=False):
                     continue
             except Exception as e:
                 findings.append(make_finding(
-                    fp, "verify", "ERROR", "UNREADABLE", str(e)))
+                    fp, LAYER_SYSTEM, "VERIFY-UNREADABLE", SEVERITY_ERROR, str(e)))
 
             unprotected.append(os.path.relpath(fp, directory))
 
@@ -998,6 +1034,75 @@ def verify_directory(directory, strict=False):
             "tampered": tampered, "findings": findings}
 
 
+def verify_zahir(filepath):
+    """Verify the visible surface (zahir) layers of a file (Layer 0, Layer 1, Layer 3b).
+
+    Checks:
+      - Layer 0: Visible Bismillah invocation at the start and end of text/code files
+      - Layer 1: Filename follows Bismillah_..._Bismillah convention
+      - Layer 3b: Al-Asma ul-Husna comment header present in code files
+
+    Companion to the batin verification path; not yet wired into
+    verify_directory (Phase 2 integration pending).
+    """
+    findings = []
+    layers = []
+    fname = os.path.basename(filepath)
+    filename_sealed = fname.startswith("Bismillah") and ("Bismillah" in fname[len("Bismillah"):])
+    if filename_sealed:
+        layers.append(LAYER_L1)
+    ext = os.path.splitext(fname)[1].lower()
+    has_start = False
+    has_end = False
+    comments_sealed = False
+    if (is_text_file(ext) or ext in ("", ".gitignore")) and ext not in SIDECAR_ONLY_EXTENSIONS:
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            for zw in (ZW_ZERO, ZW_ONE, ZW_SEP, ZW_BOUNDARY):
+                content = content.replace(zw, "")
+            lines = content.split("\n")
+            non_empty_head = [l for l in lines[:3] if l.strip()]
+            non_empty_tail = [l for l in lines[-3:] if l.strip()]
+            has_start = any("bismillah" in l.lower().replace("-", "") for l in non_empty_head)
+            has_end = any("bismillah" in l.lower().replace("-", "") for l in non_empty_tail)
+            if has_start and has_end:
+                layers.append(LAYER_L0)
+            elif has_start or has_end:
+                findings.append(make_finding(
+                    filepath, LAYER_L0, "SEAL-L0-ONE-SIDED", SEVERITY_WARNING,
+                    "Layer 0 visible Bismillah present on only one boundary"))
+            else:
+                findings.append(make_finding(
+                    filepath, LAYER_L0, "SEAL-L0-MISSING", SEVERITY_ERROR,
+                    "Layer 0 visible Bismillah absent from start and end"))
+            if "Al-Asma ul-Husna" in content:
+                comments_sealed = True
+                layers.append(LAYER_L3B)
+        except (UnicodeDecodeError, OSError) as e:
+            # PermissionError is a subclass of OSError -- caught here
+            findings.append(make_finding(
+                filepath, LAYER_L0, "SEAL-ZAHIR-READ-ERR", SEVERITY_WARNING,
+                "Unable to inspect zahir text surface: {} ({})".format(
+                    type(e).__name__, e)))
+    else:
+        sidecar_path = str(filepath) + ".bismillah"
+        if os.path.exists(sidecar_path):
+            has_start = True
+            has_end = True
+            layers.append(LAYER_L6B)
+    passed = bool(has_start and has_end)
+    return {
+        "passed": passed,
+        "has_start": has_start,
+        "has_end": has_end,
+        "filename_sealed": filename_sealed,
+        "comments_sealed": comments_sealed,
+        "layers": layers,
+        "findings": findings,
+    }
+
+
 def generate_manifest(directory):
     """Generate a Bismillah integrity manifest.
 
@@ -1019,12 +1124,9 @@ def generate_manifest(directory):
 
     manifest_path = os.path.join(directory, MANIFEST_FILENAME)
     count = 0
-    for dirpath, dirnames, filenames in os.walk(directory):
-        if '.git' in dirpath:
-            continue
-        dirnames[:] = [d for d in dirnames if d != '.git']
+    for dirpath, dirnames, filenames in _sorted_walk(directory, exclusions={'.git'}):
 
-        for fname in sorted(filenames):
+        for fname in filenames:
             fpath = os.path.join(dirpath, fname)
             rel = os.path.relpath(fpath, directory)
 
@@ -1045,8 +1147,8 @@ def generate_manifest(directory):
                 }
                 count += 1
             except Exception as e:
-                finding = make_finding(fpath, "manifest", "ERROR",
-                                       "READ_FAILED", str(e))
+                finding = make_finding(fpath, LAYER_MANIFEST,
+                                       "MANIFEST-READ-FAILED", SEVERITY_ERROR, str(e))
                 manifest["files"][rel] = {"finding": finding._asdict()}
 
     manifest["total_files"] = count
